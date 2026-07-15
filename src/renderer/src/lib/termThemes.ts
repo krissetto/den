@@ -1,4 +1,4 @@
-import type { ITheme } from '@xterm/xterm'
+import type { ITheme } from 'ghostty-web'
 
 export interface TermTheme {
   id: string

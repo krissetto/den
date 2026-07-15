@@ -1,10 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { PanelRight, Info, Play, RefreshCw, AlertTriangle } from 'lucide-react'
-import { Terminal } from '@xterm/xterm'
-import type { ITheme } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
-import { WebLinksAddon } from '@xterm/addon-web-links'
-import '@xterm/xterm/css/xterm.css'
+import { Terminal, FitAddon } from 'ghostty-web'
+import type { Ghostty, ITheme } from 'ghostty-web'
+import { loadGhostty } from '../lib/ghostty'
 import { useStore, unackedBlockCount } from '../store'
 import { termTheme as resolveTermTheme } from '../lib/termThemes'
 import type { Sandbox } from '../types'
@@ -41,6 +39,8 @@ function XTerm({ sandboxId, visible, theme, subscribe, onInput, onResize, onStar
   const onResizeRef = useRef(onResize)
   onResizeRef.current = onResize
   const [dragging, setDragging] = useState(false)
+  const [initError, setInitError] = useState<string | null>(null)
+  const themeKey = JSON.stringify(theme)
 
   // Force the attached agent to repaint. Refit, then push the size to the PTY:
   // if it changed that's a real SIGWINCH (the TUI redraws); if it's unchanged —
@@ -63,113 +63,120 @@ function XTerm({ sandboxId, visible, theme, subscribe, onInput, onResize, onStar
         resize(term.cols, Math.max(1, term.rows - 1))
         requestAnimationFrame(() => { try { resize(term.cols, term.rows) } catch { /* ignore */ } })
       }
-      term.refresh(0, term.rows - 1)
     } catch { /* ignore */ }
   }, [])
 
   useEffect(() => {
     if (!ref.current) return
-    const term = new Terminal({
-      cursorBlink: true,
-      fontFamily: 'Menlo, Monaco, "SF Mono", "DejaVu Sans Mono", monospace',
-      fontSize: 12,
-      lineHeight: 1.0,
-      theme,
-      allowProposedApi: true,
-      scrollback: 5000
-    })
-    termRef.current = term
-    const fit = new FitAddon()
-    term.loadAddon(fit)
-    // Make URLs printed by the agent (e.g. PR/auth links) clickable. xterm
-    // doesn't linkify by default, and the agent runs inside a headless sandbox
-    // that has no browser — so route the click to the host via openPath, which
-    // opens http(s) URLs in the Mac's default browser (scheme-checked in main).
-    term.loadAddon(new WebLinksAddon((_event, uri) => { window.minipit?.openPath(uri) }))
-    term.open(ref.current)
-    fitRef.current = fit
-
-    // Fit to the container and force a repaint. xterm's canvas can render blank
-    // if it was sized before layout settled (navigation, font load, dock width),
-    // so refit across a couple of frames + a delayed fallback — otherwise the
-    // screen stays empty until some resize (e.g. toggling a dock) forces a fit.
     let disposed = false
-    const refit = () => {
+    let term: Terminal | undefined
+    let fit: FitAddon | undefined
+    let settleT: ReturnType<typeof setTimeout> | undefined
+    let ro: ResizeObserver | undefined
+    let dataDisp: { dispose: () => void } | undefined
+    let selDisp: { dispose: () => void } | undefined
+    let unsub: (() => void) | undefined
+
+    const openTerminal = async () => {
+      let ghostty: Ghostty
       try {
-        fit.fit()
-        if (term.rows > 0) term.refresh(0, term.rows - 1)
-      } catch { /* container not sized yet */ }
-    }
-
-    // Track the size last pushed to the PTY. A full-screen TUI (Claude Code)
-    // only repaints on a real SIGWINCH, so if the agent attaches before layout
-    // and fonts settle it can sit blank until something resizes it — the
-    // "toggle a panel to fix the white screen" symptom. Once the grid settles we
-    // push the corrected size, which makes the agent redraw on its own.
-    const syncSize = () => {
-      if (disposed) return
-      if (term.cols !== sentColsRef.current || term.rows !== sentRowsRef.current) {
-        sentColsRef.current = term.cols; sentRowsRef.current = term.rows
-        onResize(term.cols, term.rows)
+        ghostty = await loadGhostty()
+      } catch (error) {
+        if (!disposed) setInitError(error instanceof Error ? error.message : String(error))
+        return
       }
-    }
-    const kick = () => { if (disposed) return; refit(); syncSize() }
+      if (disposed || !ref.current) return
+      setInitError(null)
+      term = new Terminal({
+        ghostty,
+        cursorBlink: true,
+        fontFamily: 'Menlo, Monaco, "SF Mono", "DejaVu Sans Mono", monospace',
+        fontSize: 12,
+        theme,
+        scrollback: 5000
+      })
+      termRef.current = term
+      fit = new FitAddon()
+      term.loadAddon(fit)
+      term.open(ref.current)
+      fitRef.current = fit
 
-    refit()
-    sentColsRef.current = term.cols; sentRowsRef.current = term.rows
-    onStart(term.cols, term.rows)
-    requestAnimationFrame(() => { kick(); requestAnimationFrame(kick) })
-    // After layout settles, force a repaint — covers a fresh terminal reattaching
-    // to an already-running agent (sandbox switch), where the size won't change so
-    // syncSize alone wouldn't trigger a redraw and the view would stay blank.
-    const settleT = setTimeout(() => { if (!disposed) forceRedraw() }, 150)
-    // Monospace metrics are sometimes measured before the web font loads, giving
-    // a mis-sized (occasionally blank) grid; refit + redraw once fonts are ready.
-    document.fonts?.ready?.then(() => { if (!disposed) forceRedraw() }).catch(() => {})
-    if (visible) setTimeout(() => { try { term.focus() } catch { /* ignore */ } }, 0)
+      const refit = () => {
+        try {
+          fit?.fit()
+        } catch { /* container not sized yet */ }
+      }
+      const syncSize = () => {
+        if (disposed || !term) return
+        if (term.cols !== sentColsRef.current || term.rows !== sentRowsRef.current) {
+          sentColsRef.current = term.cols; sentRowsRef.current = term.rows
+          onResize(term.cols, term.rows)
+        }
+      }
+      const kick = () => { if (!disposed) { refit(); syncSize() } }
 
-    const unsub = subscribe((data) => term.write(data))
-    const dataDisp = term.onData(onInput)
+      refit()
+      sentColsRef.current = term.cols; sentRowsRef.current = term.rows
+      onStart(term.cols, term.rows)
+      requestAnimationFrame(() => { kick(); requestAnimationFrame(kick) })
+      settleT = setTimeout(() => { if (!disposed) forceRedraw() }, 150)
+      document.fonts?.ready?.then(() => { if (!disposed) forceRedraw() }).catch(() => {})
+      if (visible) setTimeout(() => { try { term?.focus() } catch { /* ignore */ } }, 0)
 
-    // Copy-on-select: xterm draws its selection on a canvas (not a DOM
-    // selection), so the menu Copy role can't see it. Mirror the selection to
-    // the clipboard ourselves so text can be copied out of the terminal.
-    const selDisp = term.onSelectionChange(() => {
-      const sel = term.getSelection()
-      if (sel) navigator.clipboard?.writeText(sel).catch(() => {})
-    })
+      unsub = subscribe((data) => term?.write(data))
+      dataDisp = term.onData(onInput)
+      selDisp = term.onSelectionChange(() => {
+        const sel = term?.getSelection()
+        if (sel) navigator.clipboard?.writeText(sel).catch(() => {})
+      })
+      term.attachCustomWheelEventHandler((event) => {
+        if (!term?.hasMouseTracking()) return false
 
-    // Cmd/Ctrl+Shift+V → paste from the clipboard into the PTY (a reliable
-    // in-terminal paste that doesn't depend on the menu reaching xterm).
-    term.attachCustomKeyEventHandler((e) => {
-      if (e.type === 'keydown' && (e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'KeyV') {
-        navigator.clipboard?.readText().then((t) => { if (t) onInput(t) }).catch(() => {})
+        const canvas = ref.current?.querySelector('canvas')
+        if (!canvas) return false
+        const bounds = canvas.getBoundingClientRect()
+        // ghostty-web reserves a 12px gutter at the right of the canvas. The
+        // terminal grid ends before it, so derive cells from the content width.
+        const contentWidth = Math.max(1, bounds.width - 12)
+        const col = Math.max(1, Math.min(term.cols, Math.floor((event.clientX - bounds.left) / (contentWidth / term.cols)) + 1))
+        const row = Math.max(1, Math.min(term.rows, Math.floor((event.clientY - bounds.top) / (bounds.height / term.rows)) + 1))
+        const modifiers = (event.shiftKey ? 4 : 0) | (event.altKey ? 8 : 0) | (event.ctrlKey ? 16 : 0)
+        const button = (event.deltaY < 0 ? 64 : 65) + modifiers
+        const data = term.getMode(1006)
+          ? `\x1b[<${button};${col};${row}M`
+          : `\x1b[M${String.fromCharCode(button + 32, Math.min(255, col + 32), Math.min(255, row + 32))}`
+        onInput(data)
+        return true
+      })
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type === 'keydown' && (e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'KeyV') {
+          navigator.clipboard?.readText().then((text) => { if (text) onInput(text) }).catch(() => {})
+          return true
+        }
         return false
-      }
-      return true
-    })
+      })
 
-    const ro = new ResizeObserver(() => { kick() })
-    ro.observe(ref.current)
+      ro = new ResizeObserver(kick)
+      ro.observe(ref.current)
+    }
+
+    void openTerminal()
 
     return () => {
       disposed = true
-      clearTimeout(settleT)
-      ro.disconnect()
-      dataDisp.dispose()
-      selDisp.dispose()
+      if (settleT) clearTimeout(settleT)
+      ro?.disconnect()
+      dataDisp?.dispose()
+      selDisp?.dispose()
       unsub?.()
-      term.dispose()
+      term?.dispose()
+      termRef.current = null
+      fitRef.current = null
       onDispose?.()
     }
     // Re-create the terminal when the sandbox changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sandboxId])
-
-  // Apply theme changes live to the existing terminal.
-  useEffect(() => {
-    if (termRef.current) termRef.current.options.theme = theme
-  }, [theme])
+  }, [sandboxId, themeKey])
 
   // Force a repaint when this tab becomes visible (the inactive tab is laid out
   // at a different size than the active one, so the agent's last frame won't match
@@ -224,6 +231,11 @@ function XTerm({ sandboxId, visible, theme, subscribe, onInput, onResize, onStar
       {...dnd}
     >
       <div ref={ref} style={{ width: '100%', height: '100%', padding: '6px 8px' }} />
+      {initError && (
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, color: theme.foreground }}>
+          <span role="alert">Terminal failed to initialize: {initError}</span>
+        </div>
+      )}
       {dragging && (
         <div className="term-drop">
           <span>Drop files to attach to the agent</span>

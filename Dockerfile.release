@@ -36,6 +36,7 @@ RUN case "${TARGETARCH}" in \
 
 WORKDIR /src
 COPY package.json package-lock.json ./
+COPY scripts/patch-ghostty-web.mjs scripts/patch-ghostty-web.mjs
 RUN npm install --global npm@12.0.1
 RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
 

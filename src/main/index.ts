@@ -3343,7 +3343,7 @@ app.whenReady().then(() => {
   // 'unsafe-inline' in style-src is required for React inline style attributes.
   const CSP = [
     "default-src 'self'",
-    is.dev ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'" : "script-src 'self'",
+    is.dev ? "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'" : "script-src 'self' 'wasm-unsafe-eval'",
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: https://www.gravatar.com",
     "font-src 'self' data:",
